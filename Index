@@ -1,1 +1,322 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Relativistic N-Body Orbital Simulator</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #050508;
+            color: #00ffcc;
+            font-family: 'Courier New', Courier, monospace;
+        }
+        #canvas {
+            display: block;
+        }
+        #hud {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(5, 10, 20, 0.85);
+            padding: 12px;
+            border: 1px solid #00ffcc;
+            border-radius: 4px;
+            pointer-events: none;
+            font-size: 12px;
+            line-height: 1.4;
+        }
+        #controls-ui {
+            position: absolute;
+            bottom: 10px;
+            left: 10px;
+            background: rgba(5, 10, 20, 0.85);
+            padding: 10px;
+            border: 1px solid #00ffcc;
+            font-size: 11px;
+        }
+        .val { color: #ffffff; }
+    </style>
+</head>
+<body>
+    <div id="hud">
+        <b>PROBE TELEMETRY</b><br>
+        Speed: <span id="speed" class="val">0</span> km/s<br>
+        Altitude: <span id="alt" class="val">0</span> km<br>
+        Apoapsis: <span id="apo" class="val">0</span> km<br>
+        Periapsis: <span id="peri" class="val">0</span> km<br>
+        Eccentricity: <span id="ecc" class="val">0</span><br>
+        <hr style="border-color:#00ffcc">
+        <b>ASTROPHYSICAL PERTURBATIONS</b><br>
+        GR Schwarzschild Precession: <span id="acc-gr" class="val">0</span> m/s²<br>
+        $J_2$ Oblateness Perturbation: <span id="acc-j2" class="val">0</span> m/s²<br>
+        Lense-Thirring Frame Drag: <span id="acc-lt" class="val">0</span> m/s²<br>
+        Poynting-Robertson Solar Drag: <span id="acc-pr" class="val">0</span> m/s²<br>
+    </div>
+    <div id="controls-ui">
+        <b>CONTROLS:</b> [W] Prograde | [S] Retrograde | [A] Radial In | [D] Radial Out | [Space] Kill Relative Velocity
+    </div>
+    <canvas id="canvas"></canvas>
 
+    <script>
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+
+        function resize() {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+        }
+        window.addEventListener('resize', resize);
+        resize();
+
+        // Physical Constants (Scaled for real-time visualization viability)
+        const G = 6.67430e-11;
+        const C = 3.0e5;                 // Speed of light (scaled down to accentuate GR effects)
+        const M_CENTRAL = 5.972e24;      // Mass of Central Object (kg)
+        const R_CENTRAL = 6371000;       // Radius of Central Object (m)
+        const J2 = 0.0800;               // Extravagant J2 oblateness coefficient
+        const SPIN_ANGULAR_MOMENTUM = 1e33; // Angular momentum J for Lense-Thirring
+        const SOLAR_FLUX = 1361;         // W/m^2
+        const ATMOS_DENSITY_0 = 1.225;   // kg/m^3
+        const SCALE_HEIGHT = 8500;       // m
+
+        // Simulation Scale
+        const METERS_PER_PIXEL = 35000;
+        const DT = 1.0; // Timestep (seconds per frame)
+
+        // Probe State Vector: [x, y, vx, vy]
+        let probe = {
+            x: 0,
+            y: R_CENTRAL + 1200000,
+            vx: 6800,
+            vy: 0,
+            mass: 1000, // kg
+            crossSection: 10, // m^2
+            thrust: 15.0 // m/s^2 acceleration
+        };
+
+        let orbitHistory = [];
+        const MAX_HISTORY = 3000;
+
+        // Acceleration Breakdown Storage
+        let lastAcc = { gr: 0, j2: 0, lt: 0, pr: 0 };
+
+        // Keyboard State
+        const keys = {};
+        window.addEventListener('keydown', e => keys[e.key.toLowerCase()] = true);
+        window.addEventListener('keyup', e => keys[e.key.toLowerCase()] = false);
+
+        // --- ASTROPHYSICS ENGINE ---
+        function computeAcceleration(x, y, vx, vy) {
+            const r2 = x * x + y * y;
+            const r = Math.sqrt(r2);
+            const speed2 = vx * vx + vy * vy;
+            const speed = Math.sqrt(speed2);
+
+            if (r <= R_CENTRAL) return { ax: 0, ay: 0 };
+
+            const ux = x / r;
+            const uy = y / r;
+
+            // 1. Classical Newtonian Gravity
+            const a_newton_mag = (G * M_CENTRAL) / r2;
+            let ax = -a_newton_mag * ux;
+            let ay = -a_newton_mag * uy;
+
+            // 2. Post-Newtonian General Relativity (Schwarzschild Precession Correction)
+            // Potential term modification: F_GR = -3 * G * M * L^2 / (c^2 * r^4)
+            const h2 = Math.pow(x * vy - y * vx, 2); // Specific angular momentum squared
+            const a_gr_mag = (3 * G * M_CENTRAL * h2) / (Math.pow(C, 2) * Math.pow(r, 4));
+            ax += -a_gr_mag * ux;
+            ay += -a_gr_mag * uy;
+
+            // 3. J2 Planetary Oblateness (Zonal Harmonic Perturbation)
+            // Assumes planet rotational axis is perpendicular to 2D plane (z=0 simplification projected)
+            const j2_factor = 1.5 * J2 * (G * M_CENTRAL) * Math.pow(R_CENTRAL, 2) / Math.pow(r, 4);
+            const a_j2_x = j2_factor * ux * (5 * Math.pow(uy, 2) - 1);
+            const a_j2_y = j2_factor * uy * (5 * Math.pow(ux, 2) - 1);
+            ax += a_j2_x;
+            ay += a_j2_y;
+
+            // 4. Lense-Thirring Precession (Kerr Frame Dragging Force)
+            // Drag vector perpendicular to orbital velocity
+            const lt_factor = (2 * G * SPIN_ANGULAR_MOMENTUM) / (Math.pow(C, 2) * Math.pow(r, 3));
+            const a_lt_x = -lt_factor * vy / r;
+            const a_lt_y = lt_factor * vx / r;
+            ax += a_lt_x;
+            ay += a_lt_y;
+
+            // 5. Poynting-Robertson Radiation Drag
+            // Force directly opposing velocity due to solar photon momentum absorption/re-emission
+            const pr_factor = (SOLAR_FLUX * probe.crossSection) / (probe.mass * C * C);
+            const a_pr_x = -pr_factor * vx;
+            const a_pr_y = -pr_factor * vy;
+            ax += a_pr_x;
+            ay += a_pr_y;
+
+            // 6. Atmospheric Drag
+            const altitude = r - R_CENTRAL;
+            if (altitude > 0 && altitude < 600000) {
+                const rho = ATMOS_DENSITY_0 * Math.exp(-altitude / SCALE_HEIGHT);
+                const drag = 0.5 * rho * speed2 * 2.2 * probe.crossSection / probe.mass;
+                ax -= drag * (vx / speed);
+                ay -= drag * (vy / speed);
+            }
+
+            // Record accelerations for HUD metrics
+            lastAcc.gr = a_gr_mag;
+            lastAcc.j2 = Math.hypot(a_j2_x, a_j2_y);
+            lastAcc.lt = Math.hypot(a_lt_x, a_lt_y);
+            lastAcc.pr = Math.hypot(a_pr_x, a_pr_y);
+
+            return { ax, ay };
+        }
+
+        // --- 4TH-ORDER RUNGE-KUTTA (RK4) INTEGRATOR ---
+        function rk4Step(p, dt) {
+            // State: [x, y, vx, vy]
+            function derivatives(x, y, vx, vy) {
+                const acc = computeAcceleration(x, y, vx, vy);
+                return [vx, vy, acc.ax, acc.ay];
+            }
+
+            const [k1_x, k1_y, k1_vx, k1_vy] = derivatives(p.x, p.y, p.vx, p.vy);
+
+            const [k2_x, k2_y, k2_vx, k2_vy] = derivatives(
+                p.x + 0.5 * dt * k1_x,  p.y + 0.5 * dt * k1_y,
+                p.vx + 0.5 * dt * k1_vx, p.vy + 0.5 * dt * k1_vy
+            );
+
+            const [k3_x, k3_y, k3_vx, k3_vy] = derivatives(
+                p.x + 0.5 * dt * k2_x,  p.y + 0.5 * dt * k2_y,
+                p.vx + 0.5 * dt * k2_vx, p.vy + 0.5 * dt * k2_vy
+            );
+
+            const [k4_x, k4_y, k4_vx, k4_vy] = derivatives(
+                p.x + dt * k3_x,  p.y + dt * k3_y,
+                p.vx + dt * k3_vx, p.vy + dt * k3_vy
+            );
+
+            p.x += (dt / 6) * (k1_x + 2 * k2_x + 2 * k3_x + k4_x);
+            p.y += (dt / 6) * (k1_y + 2 * k2_y + 2 * k3_y + k4_y);
+            p.vx += (dt / 6) * (k1_vx + 2 * k2_vx + 2 * k3_vx + k4_vx);
+            p.vy += (dt / 6) * (k1_vy + 2 * k2_vy + 2 * k3_vy + k4_vy);
+        }
+
+        // --- USER INPUT & THRUST PROCESSING ---
+        function applyThrust() {
+            const vMag = Math.hypot(probe.vx, probe.vy);
+            if (vMag === 0) return;
+
+            // Unit direction vectors
+            const progradeX = probe.vx / vMag;
+            const progradeY = probe.vy / vMag;
+            const radialOutX = probe.x / Math.hypot(probe.x, probe.y);
+            const radialOutY = probe.y / Math.hypot(probe.x, probe.y);
+
+            let tax = 0, tay = 0;
+
+            if (keys['w']) { tax += progradeX * probe.thrust; tay += progradeY * probe.thrust; }
+            if (keys['s']) { tax -= progradeX * probe.thrust; tay -= progradeY * probe.thrust; }
+            if (keys['d']) { tax += radialOutX * probe.thrust; tay += radialOutY * probe.thrust; }
+            if (keys['a']) { tax -= radialOutX * probe.thrust; tay -= radialOutY * probe.thrust; }
+            if (keys[' ']) { probe.vx *= 0.95; probe.vy *= 0.95; } // RCS Dampening
+
+            probe.vx += tax * DT;
+            probe.vy += tay * DT;
+        }
+
+        // --- ORBITAL METRICS CALCULATOR ---
+        function updateHUD() {
+            const r = Math.hypot(probe.x, probe.y);
+            const v = Math.hypot(probe.vx, probe.vy);
+            const mu = G * M_CENTRAL;
+
+            // Specific Orbital Energy (E = v^2/2 - mu/r)
+            const energy = (v * v) / 2 - mu / r;
+
+            // Semi-major axis (a = -mu / (2E))
+            const a = -mu / (2 * energy);
+
+            // Specific Angular Momentum (h = r x v)
+            const h = probe.x * probe.vy - probe.y * probe.vx;
+
+            // Eccentricity (e = sqrt(1 + 2*E*h^2 / mu^2))
+            const eTerm = 1 + (2 * energy * h * h) / (mu * mu);
+            const e = eTerm > 0 ? Math.sqrt(eTerm) : 0;
+
+            const ra = a * (1 + e); // Apoapsis
+            const rp = a * (1 - e); // Periapsis
+
+            document.getElementById('speed').innerText = (v / 1000).toFixed(2);
+            document.getElementById('alt').innerText = ((r - R_CENTRAL) / 1000).toFixed(1);
+            document.getElementById('apo').innerText = energy < 0 ? ((ra - R_CENTRAL) / 1000).toFixed(1) : "Escape";
+            document.getElementById('peri').innerText = energy < 0 ? ((rp - R_CENTRAL) / 1000).toFixed(1) : "N/A";
+            document.getElementById('ecc').innerText = e.toFixed(4);
+
+            document.getElementById('acc-gr').innerText = lastAcc.gr.toExponential(3);
+            document.getElementById('acc-j2').innerText = lastAcc.j2.toExponential(3);
+            document.getElementById('acc-lt').innerText = lastAcc.lt.toExponential(3);
+            document.getElementById('acc-pr').innerText = lastAcc.pr.toExponential(3);
+        }
+
+        // --- MAIN GAME LOOP ---
+        function loop() {
+            // Sub-stepping for numerical precision
+            const subSteps = 10;
+            for (let i = 0; i < subSteps; i++) {
+                applyThrust();
+                rk4Step(probe, DT / subSteps);
+            }
+
+            // Append trajectory history
+            orbitHistory.push({ x: probe.x, y: probe.y });
+            if (orbitHistory.length > MAX_HISTORY) orbitHistory.shift();
+
+            // Render
+            ctx.fillStyle = '#050508';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            const cx = canvas.width / 2;
+            const cy = canvas.height / 2;
+
+            // Draw Central Body
+            const rPx = R_CENTRAL / METERS_PER_PIXEL;
+            ctx.beginPath();
+            ctx.arc(cx, cy, rPx, 0, Math.PI * 2);
+            ctx.fillStyle = '#1144aa';
+            ctx.fill();
+            ctx.strokeStyle = '#00aaff';
+            ctx.lineWidth = 2;
+            ctx.stroke();
+
+            // Draw Orbit Trail
+            if (orbitHistory.length > 1) {
+                ctx.beginPath();
+                for (let i = 0; i < orbitHistory.length; i++) {
+                    const px = cx + orbitHistory[i].x / METERS_PER_PIXEL;
+                    const py = cy - orbitHistory[i].y / METERS_PER_PIXEL;
+                    if (i === 0) ctx.moveTo(px, py);
+                    else ctx.lineTo(px, py);
+                }
+                ctx.strokeStyle = 'rgba(0, 255, 204, 0.4)';
+                ctx.lineWidth = 1.5;
+                ctx.stroke();
+            }
+
+            // Draw Probe
+            const px = cx + probe.x / METERS_PER_PIXEL;
+            const py = cy - probe.y / METERS_PER_PIXEL;
+            ctx.beginPath();
+            ctx.arc(px, py, 4, 0, Math.PI * 2);
+            ctx.fillStyle = '#ff0055';
+            ctx.fill();
+
+            updateHUD();
+            requestAnimationFrame(loop);
+        }
+
+        loop();
+    </script>
+</body>
+</html>
